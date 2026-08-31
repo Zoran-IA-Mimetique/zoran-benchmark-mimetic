@@ -1,0 +1,119 @@
+name: Zoran vs LoopGain direct replay
+
+on:
+  push:
+    branches:
+      - bench/loopgain-zoran-prereg-20260831
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install exact LoopGain comparator
+        run: python -m pip install --disable-pip-version-check -q loopgain==0.4.0
+      - name: Direct same-trajectory replay
+        shell: bash
+        run: |
+          cat > /tmp/direct.py <<'PY'
+          import json, urllib.request
+          from decimal import Decimal
+          from pathlib import Path
+          import loopgain
+          from loopgain import LoopGain
+
+          BENCH_COMMIT='6640702031bdefe341907d7e2dc3cf103003b4a2'
+          BASE=f'https://raw.githubusercontent.com/loopgain-ai/loopgain-bench/{BENCH_COMMIT}/data/raw'
+          FILES=[
+            'w1-codegen-claude-agent-sdk-claude-haiku-4-5-registered.jsonl',
+            'w1-codegen-langgraph-claude-haiku-4-5-registered.jsonl',
+            'w2-debate-autogen-gpt-4-1-mini-registered.jsonl',
+            'w2-debate-crewai-gpt-4-1-mini-registered.jsonl',
+            'w3-planner-langgraph-claude-sonnet-4-6-registered.jsonl',
+            'w3-planner-openai-agents-gpt-4-1-mini-registered.jsonl',
+            'w4-rag-langchain-claude-haiku-4-5-registered.jsonl',
+            'w5-adversarial-claude-haiku-4-5-registered.jsonl',
+            'w5-adversarial-crewai-claude-haiku-4-5-registered.jsonl',
+            'w5-adversarial-langgraph-claude-haiku-4-5-registered.jsonl',
+          ]
+          ZTARGET={'w1':Decimal('0.00'),'w2':Decimal('0.10'),'w3':Decimal('0.05'),'w4':Decimal('0.30'),'w5':Decimal('0.05')}
+          FRACTION=Decimal('0.05'); MAX_PROJECTED=Decimal('20')
+
+          def D(x):
+            if x is None or isinstance(x,bool): raise ValueError('non-numeric')
+            d=Decimal(str(x))
+            if not d.is_finite(): raise ValueError('non-finite')
+            return d
+          def fam(fn): return fn.split('-')[0]
+
+          def zoran(hist,target):
+            vals=[D(x) for x in hist]
+            obs=[vals[0]]
+            if vals[0] <= target:
+              return 1,min(obs),'OBJECTIVE_COMPLETED'
+            for i in range(1,len(vals)):
+              before,after=vals[i-1],vals[i]; obs.append(after)
+              gain=before-after
+              rb=max(Decimal(0),before-target); ra=max(Decimal(0),after-target)
+              reached=ra<=0
+              if gain<0: return i+1,min(obs),'OBJECTIVE_REGRESSION'
+              if gain==0 and not reached: return i+1,min(obs),'NO_MEASURABLE_PROGRESS'
+              required=rb*FRACTION
+              if not reached and gain<required: return i+1,min(obs),'GAIN_BELOW_OBJECTIVE_THRESHOLD'
+              if ra>0 and gain>0 and ra/gain>MAX_PROJECTED: return i+1,min(obs),'PROJECTED_CONVERGENCE_TOO_SLOW'
+              if reached: return i+1,min(obs),'OBJECTIVE_COMPLETED'
+            return len(vals),min(obs),'B20_HORIZON_REACHED'
+
+          rows=[]; headers={}
+          for fn in FILES:
+            with urllib.request.urlopen(f'{BASE}/{fn}',timeout=60) as r:
+              lines=[x for x in r.read().decode().splitlines() if x.strip()]
+            hdr=json.loads(lines[0]); native_target=hdr['cell'].get('target_error'); headers[fn]=native_target
+            if len(lines)-1 != 200: raise SystemExit(f'{fn}: {len(lines)-1} trials')
+            for line in lines[1:]:
+              rec=json.loads(line); hist=rec['conditions']['B20']['error_history']
+              full_best=min(float(x) for x in hist)
+              zi,zb,zreason=zoran(hist,ZTARGET[fam(fn)])
+              lg=LoopGain(target_error=native_target,max_iterations=20,assumed_fixed_cap=20)
+              for idx,e in enumerate(hist):
+                if not lg.should_continue(): break
+                lg.observe(e,output=idx)
+              lr=lg.result
+              rows.append({
+                'family':fam(fn),'file':fn,'trial_id':rec['trial_id'],'full_best':full_best,
+                'z_iters':zi,'z_best':float(zb),'z_preserved':float(zb)==full_best,'z_reason':zreason,
+                'lg_iters':lr.iterations_used,'lg_best':lr.best_error,'lg_preserved':lr.best_error==full_best,'lg_outcome':lr.outcome,
+              })
+
+          def sm(sub,prefix):
+            n=len(sub); p=sum(r[f'{prefix}_preserved'] for r in sub); mi=sum(r[f'{prefix}_iters'] for r in sub)/n
+            return {'n':n,'preserved':p,'false_stops':n-p,'preservation_rate':p/n,'false_stop_rate':(n-p)/n,'mean_iterations':mi,'iteration_reduction':1-mi/20}
+          overall={'zoran':sm(rows,'z'),'loopgain_0_4_0':sm(rows,'lg')}
+          direct={
+            'preservation_delta_pp':100*(overall['zoran']['preservation_rate']-overall['loopgain_0_4_0']['preservation_rate']),
+            'false_stop_delta_pp':100*(overall['zoran']['false_stop_rate']-overall['loopgain_0_4_0']['false_stop_rate']),
+            'iteration_reduction_delta_pp':100*(overall['zoran']['iteration_reduction']-overall['loopgain_0_4_0']['iteration_reduction']),
+          }
+          both=sum(r['z_preserved'] and r['lg_preserved'] for r in rows)
+          z_only=sum(r['z_preserved'] and not r['lg_preserved'] for r in rows)
+          lg_only=sum((not r['z_preserved']) and r['lg_preserved'] for r in rows)
+          neither=sum((not r['z_preserved']) and (not r['lg_preserved']) for r in rows)
+          report={'benchmark_commit':BENCH_COMMIT,'loopgain_runtime_version':getattr(loopgain,'__version__','unknown'),'headers':headers,'overall':overall,'delta':direct,'pairwise':{'both_preserve':both,'zoran_only':z_only,'loopgain_only':lg_only,'neither':neither},'by_family':{f:{'zoran':sm([r for r in rows if r['family']==f],'z'),'loopgain_0_4_0':sm([r for r in rows if r['family']==f],'lg')} for f in sorted(ZTARGET)}}
+          Path('direct_compare.json').write_text(json.dumps(report,indent=2,sort_keys=True))
+          z=overall['zoran']; l=overall['loopgain_0_4_0']
+          md=f'''# Direct replay: Zoran vs LoopGain 0.4.0\n\nSame 2,000 B20 trajectories, same run.\n\n| Metric | Zoran | LoopGain 0.4.0 | Delta Zoran - LoopGain |\n|---|---:|---:|---:|\n| Best result preserved | {100*z['preservation_rate']:.3f}% ({z['preserved']}/2000) | {100*l['preservation_rate']:.3f}% ({l['preserved']}/2000) | {direct['preservation_delta_pp']:+.3f} pp |\n| False stops | {100*z['false_stop_rate']:.3f}% ({z['false_stops']}/2000) | {100*l['false_stop_rate']:.3f}% ({l['false_stops']}/2000) | {direct['false_stop_delta_pp']:+.3f} pp |\n| Iterations removed vs 20 | {100*z['iteration_reduction']:.3f}% | {100*l['iteration_reduction']:.3f}% | {direct['iteration_reduction_delta_pp']:+.3f} pp |\n| Mean iterations | {z['mean_iterations']:.3f} | {l['mean_iterations']:.3f} | {z['mean_iterations']-l['mean_iterations']:+.3f} |\n\nPairwise: both={both}; Zoran-only={z_only}; LoopGain-only={lg_only}; neither={neither}.\n'''
+          Path('direct_compare.md').write_text(md)
+          print(md)
+          print(json.dumps(report['by_family'],indent=2))
+          PY
+          python /tmp/direct.py
+      - name: Upload direct comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoran-vs-loopgain-direct
+          path: |
+            direct_compare.json
+            direct_compare.md
+          if-no-files-found: error
