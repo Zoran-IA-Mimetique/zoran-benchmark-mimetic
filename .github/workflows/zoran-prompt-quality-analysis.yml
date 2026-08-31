@@ -1,0 +1,130 @@
+name: Zoran prompt quality analysis
+on:
+  push:
+    branches: [bench/loopgain-zoran-prereg-20260831]
+permissions:
+  contents: read
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          cat >/tmp/prompt_analysis.py <<'PY'
+          import json, urllib.request, itertools, re, math, statistics
+          from decimal import Decimal
+          from pathlib import Path
+          C='6640702031bdefe341907d7e2dc3cf103003b4a2';B=f'https://raw.githubusercontent.com/loopgain-ai/loopgain-bench/{C}/data/raw'
+          F=['w1-codegen-claude-agent-sdk-claude-haiku-4-5-registered.jsonl','w1-codegen-langgraph-claude-haiku-4-5-registered.jsonl','w2-debate-autogen-gpt-4-1-mini-registered.jsonl','w2-debate-crewai-gpt-4-1-mini-registered.jsonl','w3-planner-langgraph-claude-sonnet-4-6-registered.jsonl','w3-planner-openai-agents-gpt-4-1-mini-registered.jsonl','w4-rag-langchain-claude-haiku-4-5-registered.jsonl','w5-adversarial-claude-haiku-4-5-registered.jsonl','w5-adversarial-crewai-claude-haiku-4-5-registered.jsonl','w5-adversarial-langgraph-claude-haiku-4-5-registered.jsonl']
+          T={'w1':Decimal('0'),'w2':Decimal('.10'),'w3':Decimal('.05'),'w4':Decimal('.30'),'w5':Decimal('.05')}
+          def fam(f):return f.split('-')[0]
+          cells={}
+          for fn in F:
+            with urllib.request.urlopen(f'{B}/{fn}',timeout=60) as r:L=[x for x in r.read().decode().splitlines() if x.strip()]
+            recs=[]
+            for line in L[1:]:
+              rec=json.loads(line); rec['_family']=fam(fn); rec['_file']=fn
+              rec['_hist']=[Decimal(str(x)) for x in rec['conditions']['B20']['error_history']]
+              recs.append(rec)
+            assert len(recs)==200
+            cells[fn]=recs
+          def run(h,t,sg,rg):
+            obs=[h[0]]; cs=cr=0
+            if h[0]<=t:return 1,min(obs),'TARGET'
+            for i in range(1,len(h)):
+              a,b=h[i-1],h[i];obs.append(b);g=a-b;ra=max(Decimal(0),b-t)
+              if ra<=0:return i+1,min(obs),'TARGET'
+              if g==0:
+                cs+=1;cr=0
+                if cs<=sg:continue
+                return i+1,min(obs),'STALL'
+              if g<0:
+                cr+=1;cs=0
+                if cr<=rg:continue
+                return i+1,min(obs),'REGRESSION'
+              cs=cr=0
+            return len(h),min(obs),'HORIZON'
+          params=list(itertools.product(range(0,5),range(0,5)))
+          selected={}
+          rows=[]
+          for held in F:
+            train=[r for fn,rs in cells.items() if fn!=held for r in rs]
+            scored=[]
+            for sg,rg in params:
+              p=it=0
+              for r in train:
+                n,b,_=run(r['_hist'],T[r['_family']],sg,rg);it+=n;p+=(b==min(r['_hist']))
+              scored.append((p/len(train),1-(it/len(train))/20,sg,rg))
+            scored.sort(reverse=True); _,_,sg,rg=scored[0]; selected[held]=(sg,rg)
+            for r in cells[held]:
+              n,b,reason=run(r['_hist'],T[r['_family']],sg,rg)
+              rows.append({'rec':r,'ok':b==min(r['_hist']),'iters':n,'reason':reason,'sg':sg,'rg':rg})
+          assert len(rows)==2000 and sum(not x['ok'] for x in rows)==16
+          AMBIG={'good','best','better','appropriate','reasonable','convincing','relevant','clear','improve','improved','quality','strong','interesting','effective','optimal','brief','short','detailed','robust'}
+          def features(r):
+            p=r.get('prompt') or ''; low=p.lower(); words=re.findall(r"[a-zA-Z0-9_'-]+",low)
+            asserts=re.findall(r'(?m)^\s*assert\s+(.+)$',p)
+            ntests=r.get('trial_metadata',{}).get('n_tests')
+            if not isinstance(ntests,int) or ntests<=0: ntests=None
+            lhs_rhs=[]
+            for a in asserts:
+              m=re.match(r'(.+?)\s*==\s*(.+)$',a.strip())
+              if m: lhs_rhs.append((re.sub(r'\s+','',m.group(1)),m.group(2).strip()))
+            bylhs={}; contradiction=False
+            for l,v in lhs_rhs:
+              bylhs.setdefault(l,set()).add(v); contradiction |= len(bylhs[l])>1
+            tris=[tuple(words[i:i+3]) for i in range(max(0,len(words)-2))]
+            repeat_tri=(len(tris)-len(set(tris)))/len(tris) if tris else 0.0
+            amb=sum(w in AMBIG for w in words)
+            nonalnum=sum(not(ch.isalnum() or ch.isspace()) for ch in p)/max(1,len(p))
+            assert_n=len(asserts)
+            hidden_gap=(ntests-assert_n) if ntests is not None else None
+            coverage=(assert_n/ntests) if ntests else None
+            under=(ntests is not None and ntests>=3 and assert_n<=1)
+            return {'chars':len(p),'words':len(words),'asserts':assert_n,'n_tests':ntests,'hidden_test_gap':hidden_gap,'visible_test_coverage':coverage,'under_spec_one_example':under,'ambiguity_terms':amb,'repeat_trigram_ratio':repeat_tri,'symbol_noise_ratio':nonalnum,'explicit_assert_contradiction':contradiction,'question_marks':p.count('?')}
+          for x in rows:x['feat']=features(x['rec'])
+          numeric=['chars','words','asserts','hidden_test_gap','visible_test_coverage','ambiguity_terms','repeat_trigram_ratio','symbol_noise_ratio','question_marks']
+          def avg(vals):
+            vals=[v for v in vals if v is not None]
+            return sum(vals)/len(vals) if vals else None
+          compare={}
+          for k in numeric:
+            compare[k]={'fail_mean':avg([x['feat'][k] for x in rows if not x['ok']]),'pass_mean':avg([x['feat'][k] for x in rows if x['ok']])}
+          binaries=['under_spec_one_example','explicit_assert_contradiction']
+          for k in binaries:
+            a=[x for x in rows if x['feat'][k]]; b=[x for x in rows if not x['feat'][k]]
+            compare[k]={'n_true':len(a),'false_stop_rate_true':sum(not x['ok'] for x in a)/len(a) if a else None,'n_false':len(b),'false_stop_rate_false':sum(not x['ok'] for x in b)/len(b) if b else None}
+          byfam={}
+          for f in sorted(T):
+            rr=[x for x in rows if x['rec']['_family']==f]
+            byfam[f]={'n':len(rr),'false':sum(not x['ok'] for x in rr),'false_rate':sum(not x['ok'] for x in rr)/len(rr),'under_spec_rate_fail':(sum((not x['ok']) and x['feat']['under_spec_one_example'] for x in rr)/max(1,sum(not x['ok'] for x in rr))),'under_spec_rate_pass':(sum(x['ok'] and x['feat']['under_spec_one_example'] for x in rr)/max(1,sum(x['ok'] for x in rr)))}
+          failures=[]
+          for x in rows:
+            if not x['ok']:
+              r=x['rec']; failures.append({'trial_id':r['trial_id'],'family':r['_family'],'file':r['_file'],'prompt':r.get('prompt'),'features':x['feat'],'reason':x['reason'],'stop_iter':x['iters'],'global_best_iter':r['_hist'].index(min(r['_hist']))+1,'history':[float(v) for v in r['_hist']]})
+          # Duplicate task ids / prompts among failures reveal content effects across frameworks.
+          prompt_groups={}
+          for f in failures:
+            key=re.sub(r'\s+',' ',(f['prompt'] or '').strip())
+            prompt_groups.setdefault(key,[]).append(f['trial_id'])
+          duplicate_fail_prompts=[v for v in prompt_groups.values() if len(v)>1]
+          out={'n':len(rows),'false_stops':len(failures),'selected_grace':{k:{'stall':v[0],'regression':v[1]} for k,v in selected.items()},'feature_comparison':compare,'by_family':byfam,'duplicate_failure_prompts':duplicate_fail_prompts,'failures':failures}
+          Path('prompt_quality_analysis.json').write_text(json.dumps(out,indent=2))
+          md=['# Prompt-quality diagnostic on 99.20% LOCO result','',f"Held-out false stops: **{len(failures)}/2000**",'', '## Aggregate feature comparison','', '| Feature | failures | passes |','|---|---:|---:|']
+          for k in numeric:
+            a=compare[k]['fail_mean'];b=compare[k]['pass_mean']; md.append(f"| {k} | {a if a is not None else 'NA'} | {b if b is not None else 'NA'} |")
+          u=compare['under_spec_one_example']; md += ['',f"Under-specified (<=1 visible assert but >=3 hidden tests): false-stop rate **{100*u['false_stop_rate_true']:.3f}%** across n={u['n_true']} vs **{100*u['false_stop_rate_false']:.3f}%** across n={u['n_false']}." if u['false_stop_rate_false'] is not None else '']
+          md += ['','## By family','','| Family | false stops | rate | under-spec among failures | under-spec among passes |','|---|---:|---:|---:|---:|']
+          for f,s in byfam.items(): md.append(f"| {f} | {s['false']}/{s['n']} | {100*s['false_rate']:.2f}% | {100*s['under_spec_rate_fail']:.1f}% | {100*s['under_spec_rate_pass']:.1f}% |")
+          md += ['','## Duplicate prompts among failures','',json.dumps(duplicate_fail_prompts,indent=2)]
+          Path('prompt_quality_analysis.md').write_text('\n'.join(md)+'\n')
+          print(Path('prompt_quality_analysis.md').read_text())
+          PY
+          python /tmp/prompt_analysis.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zoran-prompt-quality-analysis
+          path: |
+            prompt_quality_analysis.json
+            prompt_quality_analysis.md
+          if-no-files-found: error
