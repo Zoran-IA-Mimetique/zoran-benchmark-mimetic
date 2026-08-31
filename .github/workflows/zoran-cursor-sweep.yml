@@ -1,0 +1,84 @@
+name: Zoran cursor sweep
+on:
+  push:
+    branches: [bench/loopgain-zoran-prereg-20260831]
+permissions:
+  contents: read
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          cat >/tmp/sweep.py <<'PY'
+          import json, urllib.request, itertools
+          from decimal import Decimal
+          from pathlib import Path
+          C='6640702031bdefe341907d7e2dc3cf103003b4a2'; B=f'https://raw.githubusercontent.com/loopgain-ai/loopgain-bench/{C}/data/raw'
+          F=['w1-codegen-claude-agent-sdk-claude-haiku-4-5-registered.jsonl','w1-codegen-langgraph-claude-haiku-4-5-registered.jsonl','w2-debate-autogen-gpt-4-1-mini-registered.jsonl','w2-debate-crewai-gpt-4-1-mini-registered.jsonl','w3-planner-langgraph-claude-sonnet-4-6-registered.jsonl','w3-planner-openai-agents-gpt-4-1-mini-registered.jsonl','w4-rag-langchain-claude-haiku-4-5-registered.jsonl','w5-adversarial-claude-haiku-4-5-registered.jsonl','w5-adversarial-crewai-claude-haiku-4-5-registered.jsonl','w5-adversarial-langgraph-claude-haiku-4-5-registered.jsonl']
+          T={'w1':Decimal('0'),'w2':Decimal('.10'),'w3':Decimal('.05'),'w4':Decimal('.30'),'w5':Decimal('.05')}
+          def fam(f):return f.split('-')[0]
+          trials=[]
+          for fn in F:
+            with urllib.request.urlopen(f'{B}/{fn}',timeout=60) as r:L=[x for x in r.read().decode().splitlines() if x.strip()]
+            assert len(L)==201
+            for line in L[1:]:
+              rec=json.loads(line); h=[Decimal(str(x)) for x in rec['conditions']['B20']['error_history']]
+              trials.append((fam(fn),h,min(h)))
+
+          def run(h,t,frac,proj,stall_grace,reg_grace,low_grace,slow_grace):
+            obs=[h[0]]; counters={'stall':0,'reg':0,'low':0,'slow':0}
+            if h[0] <= t:return 1,min(obs)
+            for i in range(1,len(h)):
+              a,b=h[i-1],h[i]; obs.append(b); g=a-b; rb=max(Decimal(0),a-t); ra=max(Decimal(0),b-t)
+              if ra<=0:return i+1,min(obs)
+              kind=None
+              if g<0:kind='reg'
+              elif g==0:kind='stall'
+              elif frac>0 and g<rb*frac:kind='low'
+              elif proj is not None and ra>0 and g>0 and ra/g>proj:kind='slow'
+              if kind is None:
+                for k in counters:counters[k]=0
+                continue
+              counters[kind]+=1
+              grace={'stall':stall_grace,'reg':reg_grace,'low':low_grace,'slow':slow_grace}[kind]
+              if counters[kind] <= grace:
+                continue
+              return i+1,min(obs)
+            return len(h),min(obs)
+
+          fracs=[Decimal('0'),Decimal('.01'),Decimal('.02'),Decimal('.03'),Decimal('.05')]
+          projs=[None,Decimal('20'),Decimal('30'),Decimal('50')]
+          graces=[0,1,2,3]
+          rows=[]
+          for frac,proj,sg,rg,lg,slg in itertools.product(fracs,projs,graces,graces,[0,1],[0,1]):
+            p=0; it=0
+            for f,h,best in trials:
+              n,k=run(h,T[f],frac,proj,sg,rg,lg,slg);it+=n;p+=(k==best)
+            preservation=p/len(trials); mean_it=it/len(trials); red=1-mean_it/20
+            rows.append({'fraction':float(frac),'projected':None if proj is None else float(proj),'stall_grace':sg,'regression_grace':rg,'low_gain_grace':lg,'slow_grace':slg,'preservation':preservation,'false_stop':1-preservation,'mean_iterations':mean_it,'iteration_reduction':red})
+          # Pareto: maximize preservation and iteration reduction.
+          pareto=[]
+          for r in rows:
+            dominated=False
+            for q in rows:
+              if q is r:continue
+              if q['preservation']>=r['preservation'] and q['iteration_reduction']>=r['iteration_reduction'] and (q['preservation']>r['preservation'] or q['iteration_reduction']>r['iteration_reduction']):
+                dominated=True;break
+            if not dominated:pareto.append(r)
+          rows.sort(key=lambda r:(r['preservation'],r['iteration_reduction']),reverse=True)
+          pareto.sort(key=lambda r:(r['preservation'],r['iteration_reduction']),reverse=True)
+          targets={}
+          for threshold in [0.98,0.985,0.99,0.995]:
+            c=[r for r in rows if r['preservation']>=threshold]
+            targets[str(threshold)]=max(c,key=lambda r:r['iteration_reduction']) if c else None
+          out={'n_trials':len(trials),'grid_size':len(rows),'targets':targets,'pareto_top':pareto[:30],'top_preservation':rows[:30]}
+          Path('cursor_sweep.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          print(json.dumps({'n_trials':out['n_trials'],'grid_size':out['grid_size'],'targets':targets,'pareto_top':pareto[:12]},indent=2))
+          PY
+          python /tmp/sweep.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zoran-cursor-sweep
+          path: cursor_sweep.json
+          if-no-files-found: error
