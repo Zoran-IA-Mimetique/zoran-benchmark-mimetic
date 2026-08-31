@@ -1,0 +1,70 @@
+name: Zoran LOCO validation
+on:
+  push:
+    branches: [bench/loopgain-zoran-prereg-20260831]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          cat >/tmp/loco.py <<'PY'
+          import json, urllib.request, itertools
+          from decimal import Decimal
+          from pathlib import Path
+          C='6640702031bdefe341907d7e2dc3cf103003b4a2';B=f'https://raw.githubusercontent.com/loopgain-ai/loopgain-bench/{C}/data/raw'
+          F=['w1-codegen-claude-agent-sdk-claude-haiku-4-5-registered.jsonl','w1-codegen-langgraph-claude-haiku-4-5-registered.jsonl','w2-debate-autogen-gpt-4-1-mini-registered.jsonl','w2-debate-crewai-gpt-4-1-mini-registered.jsonl','w3-planner-langgraph-claude-sonnet-4-6-registered.jsonl','w3-planner-openai-agents-gpt-4-1-mini-registered.jsonl','w4-rag-langchain-claude-haiku-4-5-registered.jsonl','w5-adversarial-claude-haiku-4-5-registered.jsonl','w5-adversarial-crewai-claude-haiku-4-5-registered.jsonl','w5-adversarial-langgraph-claude-haiku-4-5-registered.jsonl']
+          T={'w1':Decimal('0'),'w2':Decimal('.10'),'w3':Decimal('.05'),'w4':Decimal('.30'),'w5':Decimal('.05')}
+          def fam(f):return f.split('-')[0]
+          cells={}
+          for fn in F:
+            with urllib.request.urlopen(f'{B}/{fn}',timeout=60) as r:L=[x for x in r.read().decode().splitlines() if x.strip()]
+            cells[fn]=[(fam(fn),[Decimal(str(x)) for x in json.loads(line)['conditions']['B20']['error_history']]) for line in L[1:]]
+          def run(h,t,sg,rg):
+            obs=[h[0]]; cs=cr=0
+            if h[0]<=t:return 1,min(obs)
+            for i in range(1,len(h)):
+              a,b=h[i-1],h[i];obs.append(b);g=a-b;ra=max(Decimal(0),b-t)
+              if ra<=0:return i+1,min(obs)
+              if g==0:
+                cs+=1;cr=0
+                if cs<=sg:continue
+                return i+1,min(obs)
+              if g<0:
+                cr+=1;cs=0
+                if cr<=rg:continue
+                return i+1,min(obs)
+              cs=cr=0
+            return len(h),min(obs)
+          params=list(itertools.product(range(0,5),range(0,5)))
+          folds=[]; allheld=[]
+          for held in F:
+            train=[]
+            for fn,rs in cells.items():
+              if fn!=held:train+=rs
+            scored=[]
+            for sg,rg in params:
+              p=it=0
+              for f,h in train:
+                n,b=run(h,T[f],sg,rg);it+=n;p+=(b==min(h))
+              scored.append((p/len(train),1-(it/len(train))/20,sg,rg))
+            scored.sort(reverse=True)
+            # Prefer max preservation; among ties max iteration reduction.
+            _,_,sg,rg=scored[0]
+            hp=hit=0
+            for f,h in cells[held]:
+              n,b=run(h,T[f],sg,rg);hit+=n;ok=(b==min(h));hp+=ok;allheld.append((ok,n))
+            folds.append({'held':held,'selected_stall_grace':sg,'selected_regression_grace':rg,'held_preservation':hp/200,'held_false_stops':200-hp,'held_mean_iterations':hit/200,'held_iteration_reduction':1-(hit/200)/20})
+          p=sum(x[0] for x in allheld); mi=sum(x[1] for x in allheld)/len(allheld)
+          out={'n':len(allheld),'aggregate_heldout_preservation':p/len(allheld),'aggregate_heldout_false_stops':len(allheld)-p,'aggregate_mean_iterations':mi,'aggregate_iteration_reduction':1-mi/20,'folds':folds}
+          Path('loco_validation.json').write_text(json.dumps(out,indent=2))
+          print(json.dumps(out,indent=2))
+          PY
+          python /tmp/loco.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zoran-loco-validation
+          path: loco_validation.json
+          if-no-files-found: error
