@@ -1,0 +1,59 @@
+name: Zoran gap diagnostic
+on:
+  push:
+    branches: [bench/loopgain-zoran-prereg-20260831]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python -m pip install --disable-pip-version-check -q loopgain==0.6.4
+      - shell: bash
+        run: |
+          cat >/tmp/diag.py <<'PY'
+          import json, urllib.request, collections
+          from decimal import Decimal
+          from pathlib import Path
+          from loopgain import LoopGain
+          C='6640702031bdefe341907d7e2dc3cf103003b4a2'; B=f'https://raw.githubusercontent.com/loopgain-ai/loopgain-bench/{C}/data/raw'
+          F=['w1-codegen-claude-agent-sdk-claude-haiku-4-5-registered.jsonl','w1-codegen-langgraph-claude-haiku-4-5-registered.jsonl','w2-debate-autogen-gpt-4-1-mini-registered.jsonl','w2-debate-crewai-gpt-4-1-mini-registered.jsonl','w3-planner-langgraph-claude-sonnet-4-6-registered.jsonl','w3-planner-openai-agents-gpt-4-1-mini-registered.jsonl','w4-rag-langchain-claude-haiku-4-5-registered.jsonl','w5-adversarial-claude-haiku-4-5-registered.jsonl','w5-adversarial-crewai-claude-haiku-4-5-registered.jsonl','w5-adversarial-langgraph-claude-haiku-4-5-registered.jsonl']
+          T={'w1':Decimal('0'),'w2':Decimal('.10'),'w3':Decimal('.05'),'w4':Decimal('.30'),'w5':Decimal('.05')}; Q=Decimal('.05'); H=Decimal(20)
+          def fam(f):return f.split('-')[0]
+          def z(hist,t):
+            v=[Decimal(str(x)) for x in hist];o=[v[0]]
+            if v[0]<=t:return 1,min(o),'OBJECTIVE_COMPLETED'
+            for i in range(1,len(v)):
+              a,b=v[i-1],v[i];o.append(b);g=a-b;rb=max(Decimal(0),a-t);ra=max(Decimal(0),b-t);done=ra<=0
+              if g<0:return i+1,min(o),'OBJECTIVE_REGRESSION'
+              if g==0 and not done:return i+1,min(o),'NO_MEASURABLE_PROGRESS'
+              if not done and g<rb*Q:return i+1,min(o),'GAIN_BELOW_OBJECTIVE_THRESHOLD'
+              if ra>0 and g>0 and ra/g>H:return i+1,min(o),'PROJECTED_CONVERGENCE_TOO_SLOW'
+              if done:return i+1,min(o),'OBJECTIVE_COMPLETED'
+            return len(v),min(o),'B20_HORIZON_REACHED'
+          gap=[]; zfalse=[]
+          for fn in F:
+            with urllib.request.urlopen(f'{B}/{fn}',timeout=60) as r:L=[x for x in r.read().decode().splitlines() if x.strip()]
+            nt=json.loads(L[0])['cell'].get('target_error')
+            for line in L[1:]:
+              rec=json.loads(line);h=rec['conditions']['B20']['error_history'];best=min(float(x) for x in h);best_idx=h.index(best);zi,zb,zr=z(h,T[fam(fn)])
+              lg=LoopGain(target_error=nt,max_iterations=20,assumed_fixed_cap=20)
+              states=[]
+              for i,e in enumerate(h):
+                if not lg.should_continue():break
+                states.append(lg.observe(e,output=i))
+              lr=lg.result; zp=float(zb)==best; lp=lr.best_error==best
+              item={'trial_id':rec['trial_id'],'family':fam(fn),'file':fn,'history':h,'global_best':best,'global_best_iteration':best_idx+1,'zoran_stop_iteration':zi,'zoran_reason':zr,'zoran_best':float(zb),'loopgain_stop_iteration':lr.iterations_used,'loopgain_outcome':lr.outcome,'loopgain_best':lr.best_error,'loopgain_states':states}
+              if not zp:zfalse.append(item)
+              if (not zp) and lp:gap.append(item)
+          out={'gap_n':len(gap),'zoran_false_n':len(zfalse),'gap_by_family':dict(collections.Counter(x['family'] for x in gap)),'gap_by_zoran_reason':dict(collections.Counter(x['zoran_reason'] for x in gap)),'zoran_false_by_reason':dict(collections.Counter(x['zoran_reason'] for x in zfalse)),'gap_cases':gap}
+          Path('gap_diagnostic.json').write_text(json.dumps(out,indent=2))
+          print(json.dumps({k:v for k,v in out.items() if k!='gap_cases'},indent=2))
+          for x in gap:print(x['trial_id'],x['zoran_reason'],x['history'],'Zstop',x['zoran_stop_iteration'],'LGstop',x['loopgain_stop_iteration'],x['loopgain_outcome'])
+          PY
+          python /tmp/diag.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zoran-gap-diagnostic
+          path: gap_diagnostic.json
+          if-no-files-found: error
