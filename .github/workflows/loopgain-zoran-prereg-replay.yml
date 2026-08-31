@@ -1,0 +1,155 @@
+name: LoopGain Zoran prereg replay
+
+on:
+  push:
+    branches:
+      - bench/loopgain-zoran-prereg-20260831
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run frozen replay
+        shell: bash
+        run: |
+          cat > /tmp/replay.py <<'PY'
+          import json, math, statistics, urllib.request
+          from decimal import Decimal, InvalidOperation
+          from pathlib import Path
+
+          COMMIT = "6640702031bdefe341907d7e2dc3cf103003b4a2"
+          BASE = f"https://raw.githubusercontent.com/loopgain-ai/loopgain-bench/{COMMIT}/data/raw"
+          FILES = [
+              "w1-codegen-claude-agent-sdk-claude-haiku-4-5-registered.jsonl",
+              "w1-codegen-langgraph-claude-haiku-4-5-registered.jsonl",
+              "w2-debate-autogen-gpt-4-1-mini-registered.jsonl",
+              "w2-debate-crewai-gpt-4-1-mini-registered.jsonl",
+              "w3-planner-langgraph-claude-sonnet-4-6-registered.jsonl",
+              "w3-planner-openai-agents-gpt-4-1-mini-registered.jsonl",
+              "w4-rag-langchain-claude-haiku-4-5-registered.jsonl",
+              "w5-adversarial-claude-haiku-4-5-registered.jsonl",
+              "w5-adversarial-crewai-claude-haiku-4-5-registered.jsonl",
+              "w5-adversarial-langgraph-claude-haiku-4-5-registered.jsonl",
+          ]
+          # Frozen SOTA_LOOPGAIN_PREREG_V1 mapping.
+          TARGET = {"w1": Decimal("0.00"), "w2": Decimal("0.10"), "w3": Decimal("0.05"), "w4": Decimal("0.30"), "w5": Decimal("0.05")}
+          FRACTION = Decimal("0.05")
+          MAX_PROJECTED = Decimal("20")
+
+          def D(x):
+              if x is None or isinstance(x, bool):
+                  raise ValueError("missing/non-numeric")
+              d = Decimal(str(x))
+              if not d.is_finite():
+                  raise ValueError("non-finite")
+              return d
+
+          def family(filename):
+              return filename.split("-")[0]
+
+          def replay(history, target):
+              vals = [D(x) for x in history]
+              if not vals:
+                  return {"status":"NON_MESURE","iterations":0,"selected":None,"reason":"EMPTY_HISTORY"}
+              observed = [vals[0]]
+              if vals[0] <= target:
+                  return {"status":"PASS","iterations":1,"selected":min(observed),"reason":"OBJECTIVE_COMPLETED"}
+              for idx in range(1, len(vals)):
+                  before, after = vals[idx-1], vals[idx]
+                  observed.append(after)
+                  gain = before - after
+                  rem_before = max(Decimal(0), before - target)
+                  rem_after = max(Decimal(0), after - target)
+                  reached = rem_after <= 0
+                  if gain < 0:
+                      return {"status":"VETO","iterations":idx+1,"selected":min(observed),"reason":"OBJECTIVE_REGRESSION"}
+                  if gain == 0 and not reached:
+                      return {"status":"VETO","iterations":idx+1,"selected":min(observed),"reason":"NO_MEASURABLE_PROGRESS"}
+                  required = rem_before * FRACTION
+                  if (not reached) and gain < required:
+                      return {"status":"VETO","iterations":idx+1,"selected":min(observed),"reason":"GAIN_BELOW_OBJECTIVE_THRESHOLD"}
+                  if rem_after > 0 and gain > 0:
+                      projected = rem_after / gain
+                      if projected > MAX_PROJECTED:
+                          return {"status":"VETO","iterations":idx+1,"selected":min(observed),"reason":"PROJECTED_CONVERGENCE_TOO_SLOW"}
+                  if reached:
+                      return {"status":"PASS","iterations":idx+1,"selected":min(observed),"reason":"OBJECTIVE_COMPLETED"}
+              return {"status":"PASS","iterations":len(vals),"selected":min(observed),"reason":"B20_HORIZON_REACHED"}
+
+          rows=[]
+          header_targets={}
+          for fn in FILES:
+              url=f"{BASE}/{fn}"
+              with urllib.request.urlopen(url, timeout=60) as r:
+                  text=r.read().decode("utf-8")
+              lines=[x for x in text.splitlines() if x.strip()]
+              hdr=json.loads(lines[0])
+              fam=family(fn)
+              header_targets[fn]=hdr.get("cell",{}).get("target_error")
+              count=0
+              for line in lines[1:]:
+                  rec=json.loads(line)
+                  hist=rec["conditions"]["B20"]["error_history"]
+                  full=[D(x) for x in hist]
+                  out=replay(hist,TARGET[fam])
+                  full_best=min(full)
+                  selected=out["selected"]
+                  preserved=(selected == full_best) if selected is not None else False
+                  rows.append({
+                      "file":fn,"family":fam,"trial_id":rec["trial_id"],
+                      "iterations":out["iterations"],"reason":out["reason"],"status":out["status"],
+                      "selected":str(selected) if selected is not None else None,
+                      "full_best":str(full_best),"preserved":preserved,
+                  })
+                  count+=1
+              if count != 200:
+                  raise SystemExit(f"{fn}: expected 200 trials, got {count}")
+
+          def summarize(sub):
+              n=len(sub)
+              measured=[r for r in sub if r["status"] != "NON_MESURE"]
+              preserved=sum(r["preserved"] for r in measured)
+              false=len(measured)-preserved
+              mean_iters=sum(r["iterations"] for r in measured)/len(measured) if measured else float("nan")
+              return {
+                  "n":n,"measured":len(measured),"non_mesure":n-len(measured),
+                  "best_preservation_rate":preserved/len(measured) if measured else None,
+                  "false_stop_rate":false/len(measured) if measured else None,
+                  "preserved":preserved,"false_stops":false,
+                  "mean_iterations_used":mean_iters,
+                  "iteration_reduction_vs_B20":1-(mean_iters/20) if measured else None,
+                  "reason_counts":{k:sum(r["reason"]==k for r in measured) for k in sorted(set(r["reason"] for r in measured))},
+              }
+
+          report={
+              "replay_id":"ZORAN_PROGRESS_GUARD_V2_ON_LOOPGAIN_B20_PREREG_V1",
+              "loopgain_commit":COMMIT,
+              "policy":{"direction":"minimize","min_absolute_gain":0,"min_fraction_of_remaining":0.05,"min_gain_per_cost":0,"completion_tolerance":0,"max_projected_steps":20,"targets":{k:str(v) for k,v in TARGET.items()}},
+              "header_target_errors":header_targets,
+              "overall":summarize(rows),
+              "by_family":{f:summarize([r for r in rows if r["family"]==f]) for f in sorted(TARGET)},
+              "by_cell":{fn:summarize([r for r in rows if r["file"]==fn]) for fn in FILES},
+          }
+          Path("benchmark_result.json").write_text(json.dumps(report,indent=2,sort_keys=True),encoding="utf-8")
+          o=report["overall"]
+          md=["# Zoran ProgressGuard v2 vs LoopGain public B20 trajectories","",f"LoopGain corpus commit: `{COMMIT}`","","## Frozen replay result","",f"- Trials: **{o['n']}**",f"- Measured: **{o['measured']}**",f"- Best-preservation: **{100*o['best_preservation_rate']:.3f}%** ({o['preserved']}/{o['measured']})",f"- False-stop: **{100*o['false_stop_rate']:.3f}%** ({o['false_stops']}/{o['measured']})",f"- Mean iterations used: **{o['mean_iterations_used']:.3f}/20**",f"- Iteration reduction vs B20: **{100*o['iteration_reduction_vs_B20']:.3f}%**","","## By workload family","","| Family | n | Preservation | False-stop | Mean iters | Reduction |","|---|---:|---:|---:|---:|---:|"]
+          for f,s in report["by_family"].items():
+              md.append(f"| {f.upper()} | {s['n']} | {100*s['best_preservation_rate']:.3f}% | {100*s['false_stop_rate']:.3f}% | {s['mean_iterations_used']:.3f} | {100*s['iteration_reduction_vs_B20']:.3f}% |")
+          md += ["","## Stop reasons",""]
+          for k,v in o["reason_counts"].items(): md.append(f"- {k}: {v}")
+          md += ["","## Target discrepancy audit","", "Frozen prereg targets are used exactly. Raw JSONL header target_error values are recorded separately in benchmark_result.json; no threshold was changed after seeing results."]
+          Path("benchmark_result.md").write_text("\n".join(md)+"\n",encoding="utf-8")
+          print(Path("benchmark_result.md").read_text())
+          PY
+          python /tmp/replay.py
+      - name: Upload replay evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoran-loopgain-prereg-replay
+          path: |
+            benchmark_result.json
+            benchmark_result.md
+          if-no-files-found: error
