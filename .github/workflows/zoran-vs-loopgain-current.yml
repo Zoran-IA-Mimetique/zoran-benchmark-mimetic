@@ -1,0 +1,67 @@
+name: Zoran vs LoopGain current
+
+on:
+  push:
+    branches:
+      - bench/loopgain-zoran-prereg-20260831
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python -m pip install --disable-pip-version-check -q loopgain==0.6.4
+      - name: Replay same 2000 B20 trajectories
+        shell: bash
+        run: |
+          cat > /tmp/current.py <<'PY'
+          import json, urllib.request
+          from decimal import Decimal
+          from pathlib import Path
+          import loopgain
+          from loopgain import LoopGain
+          C='6640702031bdefe341907d7e2dc3cf103003b4a2'
+          B=f'https://raw.githubusercontent.com/loopgain-ai/loopgain-bench/{C}/data/raw'
+          F=['w1-codegen-claude-agent-sdk-claude-haiku-4-5-registered.jsonl','w1-codegen-langgraph-claude-haiku-4-5-registered.jsonl','w2-debate-autogen-gpt-4-1-mini-registered.jsonl','w2-debate-crewai-gpt-4-1-mini-registered.jsonl','w3-planner-langgraph-claude-sonnet-4-6-registered.jsonl','w3-planner-openai-agents-gpt-4-1-mini-registered.jsonl','w4-rag-langchain-claude-haiku-4-5-registered.jsonl','w5-adversarial-claude-haiku-4-5-registered.jsonl','w5-adversarial-crewai-claude-haiku-4-5-registered.jsonl','w5-adversarial-langgraph-claude-haiku-4-5-registered.jsonl']
+          T={'w1':Decimal('0'),'w2':Decimal('.10'),'w3':Decimal('.05'),'w4':Decimal('.30'),'w5':Decimal('.05')}; Q=Decimal('.05'); H=Decimal('20')
+          def fam(x): return x.split('-')[0]
+          def z(h,t):
+            v=[Decimal(str(x)) for x in h]; o=[v[0]]
+            if v[0]<=t:return 1,min(o)
+            for i in range(1,len(v)):
+              a,b=v[i-1],v[i];o.append(b);g=a-b;rb=max(Decimal(0),a-t);ra=max(Decimal(0),b-t);done=ra<=0
+              if g<0:return i+1,min(o)
+              if g==0 and not done:return i+1,min(o)
+              if not done and g<rb*Q:return i+1,min(o)
+              if ra>0 and g>0 and ra/g>H:return i+1,min(o)
+              if done:return i+1,min(o)
+            return len(v),min(o)
+          rows=[]
+          for fn in F:
+            with urllib.request.urlopen(f'{B}/{fn}',timeout=60) as r: L=[x for x in r.read().decode().splitlines() if x.strip()]
+            hdr=json.loads(L[0]); nt=hdr['cell'].get('target_error')
+            assert len(L)==201
+            for line in L[1:]:
+              rec=json.loads(line);h=rec['conditions']['B20']['error_history']; best=min(float(x) for x in h);zi,zb=z(h,T[fam(fn)])
+              lg=LoopGain(target_error=nt,max_iterations=20,assumed_fixed_cap=20)
+              for i,e in enumerate(h):
+                if not lg.should_continue():break
+                lg.observe(e,output=i)
+              lr=lg.result
+              rows.append((fam(fn),zi,float(zb)==best,lr.iterations_used,lr.best_error==best))
+          def s(rs,pos_i,pos_p):
+            n=len(rs);p=sum(r[pos_p] for r in rs);m=sum(r[pos_i] for r in rs)/n
+            return {'n':n,'preserved':p,'false_stops':n-p,'preservation_rate':p/n,'false_stop_rate':(n-p)/n,'mean_iterations':m,'iteration_reduction':1-m/20}
+          Z=s(rows,1,2);L=s(rows,3,4)
+          out={'loopgain_version':getattr(loopgain,'__version__','unknown'),'zoran':Z,'loopgain':L,'delta_pp':{'preservation':100*(Z['preservation_rate']-L['preservation_rate']),'false_stop':100*(Z['false_stop_rate']-L['false_stop_rate']),'iteration_reduction':100*(Z['iteration_reduction']-L['iteration_reduction'])},'pairwise':{'both':sum(r[2] and r[4] for r in rows),'zoran_only':sum(r[2] and not r[4] for r in rows),'loopgain_only':sum(not r[2] and r[4] for r in rows),'neither':sum(not r[2] and not r[4] for r in rows)},'by_family':{f:{'zoran':s([r for r in rows if r[0]==f],1,2),'loopgain':s([r for r in rows if r[0]==f],3,4)} for f in sorted(T)}}
+          Path('current_compare.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          print(json.dumps(out,indent=2))
+          PY
+          python /tmp/current.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zoran-vs-loopgain-current
+          path: current_compare.json
+          if-no-files-found: error
