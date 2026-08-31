@@ -1,0 +1,62 @@
+name: Zoran exploratory recovery
+on:
+  push:
+    branches: [bench/loopgain-zoran-prereg-20260831]
+permissions:
+  contents: read
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          cat >/tmp/explore.py <<'PY'
+          import json, urllib.request
+          from decimal import Decimal
+          from pathlib import Path
+          C='6640702031bdefe341907d7e2dc3cf103003b4a2';B=f'https://raw.githubusercontent.com/loopgain-ai/loopgain-bench/{C}/data/raw'
+          F=['w1-codegen-claude-agent-sdk-claude-haiku-4-5-registered.jsonl','w1-codegen-langgraph-claude-haiku-4-5-registered.jsonl','w2-debate-autogen-gpt-4-1-mini-registered.jsonl','w2-debate-crewai-gpt-4-1-mini-registered.jsonl','w3-planner-langgraph-claude-sonnet-4-6-registered.jsonl','w3-planner-openai-agents-gpt-4-1-mini-registered.jsonl','w4-rag-langchain-claude-haiku-4-5-registered.jsonl','w5-adversarial-claude-haiku-4-5-registered.jsonl','w5-adversarial-crewai-claude-haiku-4-5-registered.jsonl','w5-adversarial-langgraph-claude-haiku-4-5-registered.jsonl']
+          T={'w1':Decimal('0'),'w2':Decimal('.10'),'w3':Decimal('.05'),'w4':Decimal('.30'),'w5':Decimal('.05')};Q=Decimal('.05');H=Decimal(20)
+          def fam(f):return f.split('-')[0]
+          def violation(a,b,t):
+            g=a-b;rb=max(Decimal(0),a-t);ra=max(Decimal(0),b-t);done=ra<=0
+            if done:return None,'OBJECTIVE_COMPLETED'
+            if g<0:return 'regression','OBJECTIVE_REGRESSION'
+            if g==0:return 'stall','NO_MEASURABLE_PROGRESS'
+            if g<rb*Q:return 'low','GAIN_BELOW_OBJECTIVE_THRESHOLD'
+            if ra>0 and g>0 and ra/g>H:return 'slow','PROJECTED_CONVERGENCE_TOO_SLOW'
+            return None,'SIGNIFICANT_PROGRESS'
+          def run(hist,t,grace_stall=False,grace_reg=False):
+            v=[Decimal(str(x)) for x in hist];obs=[v[0]];pending=False
+            if v[0]<=t:return 1,min(obs)
+            for i in range(1,len(v)):
+              a,b=v[i-1],v[i];obs.append(b);kind,reason=violation(a,b,t)
+              if reason=='OBJECTIVE_COMPLETED':return i+1,min(obs)
+              if kind is None:pending=False;continue
+              eligible=(kind=='stall' and grace_stall) or (kind=='regression' and grace_reg)
+              if eligible and not pending:
+                pending=True;continue
+              return i+1,min(obs)
+            return len(v),min(obs)
+          modes={'frozen':(False,False),'stall_grace1':(True,False),'regression_grace1':(False,True),'both_grace1':(True,True)}
+          data=[]
+          for fn in F:
+            with urllib.request.urlopen(f'{B}/{fn}',timeout=60) as r:L=[x for x in r.read().decode().splitlines() if x.strip()]
+            for line in L[1:]:
+              h=json.loads(line)['conditions']['B20']['error_history'];best=min(float(x) for x in h)
+              rec={'family':fam(fn),'best':best}
+              for m,(gs,gr) in modes.items():
+                it,b=run(h,T[fam(fn)],gs,gr);rec[m]=(it,float(b)==best)
+              data.append(rec)
+          out={}
+          for m in modes:
+            n=len(data);p=sum(x[m][1] for x in data);mi=sum(x[m][0] for x in data)/n
+            out[m]={'preservation_rate':p/n,'preserved':p,'false_stops':n-p,'mean_iterations':mi,'iteration_reduction':1-mi/20}
+          Path('exploratory_recovery.json').write_text(json.dumps(out,indent=2,sort_keys=True))
+          print(json.dumps(out,indent=2))
+          PY
+          python /tmp/explore.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zoran-exploratory-recovery
+          path: exploratory_recovery.json
